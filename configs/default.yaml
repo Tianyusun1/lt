@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.2/configs/default.yaml (V5.18: Final Optimized for RL Stability & 6K Data)
+# File: tianyusun1/test2/test2-5.2/configs/default.yaml (V6.0: Final Complete Version)
 
 model:
   # BERT encoder
@@ -15,7 +15,7 @@ model:
   # === CVAE Parameters ===
   latent_dim: 64          
 
-  # --- Legacy Discrete Parameters ---
+  # --- Legacy Discrete Parameters (保留即可，暂未使用) ---
   num_bbox_bins: 1000
   cls_embed_dim: 32
   bbox_embed_dim: 24
@@ -28,72 +28,91 @@ model:
   area_loss_weight: 1.0     
   
   # 2. 逻辑与空间约束 (KG增强)
+  # [V6.0] 关系权重很高，保证生成的 TxT 矩阵逻辑被遵守
   relation_loss_weight: 5.0 
   overlap_loss_weight: 3.0  
   size_loss_weight: 2.0     
   
   # 3. 聚类约束 (Clustering)
-  clustering_loss_weight: 1.0
+  # [V6.0 Note] 对于数量扩展出的同类物体 (如5个山)，聚类很重要，防止它们散得太远
+  clustering_loss_weight: 1.5 
   
   # 4. 审美约束 (Aesthetic)
-  alignment_loss_weight: 0.0 
-  balance_loss_weight: 0.0   
+  alignment_loss_weight: 0.5 
+  balance_loss_weight: 0.5   
   
-  # Legacy weights
+  # 5. [NEW V6.0] 双流一致性约束 (Self-Supervision)
+  # 强迫 Layout Stream 的语义与 Text Stream 保持一致
+  consistency_loss_weight: 1.0
+
+  # Legacy weights (保持为 0)
   coord_loss_weight: 0.0    
   cls_loss_weight: 0.0      
   count_loss_weight: 0.0    
 
-  # Inference
-  max_elements: 30
+  # === Inference / Generation Limits ===
+  # [V6.0 Critical] 调大上限以支持 Quantity Expansion ("千峰"可能生成5个)
+  max_elements: 40 
   
-  # Data paths (Updated for 610-sty environment)
+  # Data paths (根据您的环境设置)
   xlsx_path: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800poems.xlsx"
   images_dir: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800"
   labels_dir: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800/JPEGImages-pre_new_txt"
-  max_layout_length: 30
+  
+  # [V6.0 Critical] 必须与 max_elements 保持一致
+  max_layout_length: 40
   max_text_length: 64
 
 training:
   # === Stage 1: Supervised Pre-training ===
-  batch_size: 128         
-  epochs: 200             
+  # [V6.0 Critical] 建议设为 32 或 16。
+  # 以前是 128，但现在矩阵变大了 (40x40) 且有 Gate 计算，显存压力增加。
+  batch_size: 32         
+  epochs: 200            
   learning_rate: 0.0001
   warmup_steps: 1000      
   
   # Logging & Saving
   save_every: 50          
-  output_dir: "./outputs/rl"
+  output_dir: "./outputs"
   log_steps: 10
   visualize_every: 5      
 
-  # === Stage 2: RL Fine-tuning Configuration (CRITICAL UPDATES) ===
-  # [修改点 1] 学习率适度调高 (2e-5)，打破"死守中心"的僵局
+  # === Stage 2: RL Fine-tuning Configuration ===
   rl_epochs: 300          
-  rl_learning_rate: 2e-5  # 保持微小的学习率，但比 5e-6 大，允许参数变动
+  rl_learning_rate: 2e-5  # 微调学习率
   
-  # RL Rewards Weights (可以在这里集中管理)
+  # RL Rewards Weights
   reward_weights:
-    iou: 2.0              # [核心] 保持高权重，稳住有标注的数据
+    # 稳住基本盘
+    iou: 2.0
     
-    # [关键修改] 大幅提高关系奖励 (5.0)，强迫模型"读懂"诗句逻辑
-    # 这是防止模型忽略输入、生成千篇一律布局的关键
+    # [核心] 强逻辑约束
     relation: 5.0         
     
-    # [修改点 2] 保持较低的分散度权重 (0.5)
-    # 代码中已改为计算"最近邻距离"，配合 0.5 的权重即可实现"不堆叠"且"不贴角"
-    dispersion: 0.5       
+    # [V6.0 调整] 降低分散度权重 (从 0.5 -> 0.3)
+    # 因为物体多了，如果太强调分散，"千峰"会被挤出画布，甚至导致重叠惩罚失效
+    dispersion: 0.3       
     
-    overlap: -0.5         # 惩罚重叠 (负分)
+    # 惩罚重叠 (负分)
+    overlap: -0.5         
+    
+    # [建议] 构图奖励，鼓励物体分布在美学点(三分线)上
+    composition: 1.0
 
 inference:
-  max_output_length: 30
+  # 保持一致
+  max_output_length: 40
 
-
-
-#python scripts/train.py
-# python scripts/train.py \
-#     --rl_tuning \
-#     --checkpoint outputs/model_best_val_loss_1.234.pth
-
-#python scripts/infer.py --num_samples 5 --mode sample
+  
+# 使用说明:
+# 1. 预训练:
+#    python scripts/train.py
+#
+# 2. RL 微调 (加载预训练最好的模型):
+#    python scripts/train.py \
+#      --rl_tuning \
+#      --checkpoint outputs/model_best_val_loss_X.XXX.pth
+#
+# 3. 推理:
+#    python scripts/infer.py --num_samples 5 --mode sample

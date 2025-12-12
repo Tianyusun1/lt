@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.1/trainers/trainer.py (V5.4: CLUSTERING LOSS SUPPORT)
+# File: tianyusun1/test2/test2-5.1/trainers/trainer.py (V5.7: ROBUST KL + CONSISTENCY)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -30,6 +30,9 @@ from torch.optim.lr_scheduler import LambdaLR
 from inference.greedy_decode import greedy_decode_poem_layout 
 from data.visualize import draw_layout
 import matplotlib.pyplot as plt 
+
+# --- [MODIFIED] 导入新的 KL 计算函数 ---
+from trainers.loss import compute_kl_loss
 # ---------------------------------------------
 
 
@@ -241,7 +244,8 @@ class LayoutTrainer:
                     location_grids = location_grids.to(self.device)
                 
                 # 2. 前向传播 (CVAE)
-                mu, logvar, pred_boxes, _ = self.model(
+                # [MODIFIED] 捕获 decoder_output 以用于一致性损失计算
+                mu, logvar, pred_boxes, decoder_output = self.model(
                     input_ids=input_ids, 
                     attention_mask=attention_mask, 
                     kg_class_ids=kg_class_ids, 
@@ -263,16 +267,18 @@ class LayoutTrainer:
                     target_coords_gt=target_boxes,
                     kg_spatial_matrix=kg_spatial_matrix,
                     kg_class_weights=kg_class_weights,
-                    kg_class_ids=kg_class_ids # [NEW] Pass class IDs for clustering
+                    kg_class_ids=kg_class_ids, # [NEW] Pass class IDs for clustering
+                    decoder_output=decoder_output # [NEW] Pass decoder_output for consistency loss
                 )
                 
-                # [MODIFIED V5.4] 解包重建损失 (共 10 个)
-                loss_recons, relation_loss, overlap_loss, reg_loss, iou_loss, size_loss, area_loss, align_loss, balance_loss, clustering_loss = loss_tuple
+                # [MODIFIED V5.7] 解包重建损失 (共 11 个, 新增 loss_consistency)
+                loss_recons, relation_loss, overlap_loss, reg_loss, iou_loss, size_loss, area_loss, align_loss, balance_loss, clustering_loss, consistency_loss = loss_tuple
                 
                 # 4. 计算 KL 散度损失 (KL Divergence)
                 if mu is not None and logvar is not None:
-                    # Sum over latent dim, Mean over batch
-                    kl_val = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+                    # [MODIFIED] 使用健壮的 KL 计算函数 (含 Free Bits 机制)
+                    # free_bits=1.0 允许每个样本保留 1 nat 的信息量而不受惩罚，防止坍缩
+                    kl_val = compute_kl_loss(mu, logvar, free_bits=1.0)
                 else:
                     kl_val = torch.tensor(0.0, device=self.device)
                 
@@ -316,6 +322,7 @@ class LayoutTrainer:
                           f"Alg: {align_loss.item():.3f} | "
                           f"Bal: {balance_loss.item():.3f} | "
                           f"Clus: {clustering_loss.item():.3f} | "
+                          f"Cons: {consistency_loss.item():.3f} | "
                           f"KL: {kl_val.item():.4f}")
         
         # 计算平均损失

@@ -1,4 +1,4 @@
-# models/poem2layout.py (V5.6: ADDED RL SUPPORT)
+# models/poem2layout.py (V5.21: FULL FIX - REL_ID & MATRIX COMPATIBILITY)
 
 import torch
 import torch.nn as nn
@@ -60,6 +60,19 @@ class GraphRelationPriorNet(nn.Module):
         k = self.k_proj(node_features).view(B, T, H, d_k)
         v = self.v_proj(node_features).view(B, T, H, d_k)
 
+        # [FIX] 安全处理 spatial_matrix 维度
+        # 如果 spatial_matrix 是 [B, T, T]，直接使用
+        # 如果是 [B, 9, 9]，则需要外部 gather 处理好再传进来
+        # 这里的 spatial_matrix 应该是已经对齐到 T x T 的
+        
+        # 截断以防越界 (如果 T 变小了)
+        curr_T = spatial_matrix.shape[1]
+        if curr_T > T:
+            spatial_matrix = spatial_matrix[:, :T, :T]
+        elif curr_T < T:
+            # Pad if needed (unlikely if logic is correct)
+            pass
+
         r_k = self.rel_embed_k(spatial_matrix).view(B, T, T, H, d_k)
         r_v = self.rel_embed_v(spatial_matrix).view(B, T, T, H, d_k)
 
@@ -115,7 +128,7 @@ class LayoutTransformerEncoder(nn.Module):
             
         return global_feat
 
-# === 主模型更新 ===
+# === 主模型更新: Poem2LayoutGenerator ===
 class Poem2LayoutGenerator(nn.Module):
     def __init__(self, bert_path: str, num_classes: int, hidden_size: int = 768, bb_size: int = 64, 
                  decoder_layers: int = 4, decoder_heads: int = 8, dropout: float = 0.1, 
@@ -126,6 +139,7 @@ class Poem2LayoutGenerator(nn.Module):
                  alignment_loss_weight: float = 0.5,
                  balance_loss_weight: float = 0.5,
                  clustering_loss_weight: float = 1.0, 
+                 consistency_loss_weight: float = 1.0, 
                  latent_dim: int = 32,               
                  **kwargs): 
         super(Poem2LayoutGenerator, self).__init__()
@@ -145,6 +159,7 @@ class Poem2LayoutGenerator(nn.Module):
         self.alignment_loss_weight = alignment_loss_weight
         self.balance_loss_weight = balance_loss_weight
         self.clustering_loss_weight = clustering_loss_weight
+        self.consistency_loss_weight = consistency_loss_weight
         
         self.cond_dropout = nn.Dropout(0.25)
 
@@ -215,6 +230,9 @@ class Poem2LayoutGenerator(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 4)
         )
+        
+        # 10. Dual-Stream Consistency Projection
+        self.consistency_proj = nn.Linear(bb_size, hidden_size)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -222,21 +240,47 @@ class Poem2LayoutGenerator(nn.Module):
         return mu + eps * std
 
     def construct_spatial_bias(self, cls_ids, kg_spatial_matrix):
+        """
+        [V6.0 Compatible] 
+        自动检测 kg_spatial_matrix 是 Class-based (9x9) 还是 Instance-based (TxT)。
+        """
         if kg_spatial_matrix is None:
             return None
+            
         B, S = cls_ids.shape
-        map_ids = cls_ids - 2 
-        gather_ids = map_ids.clamp(min=0, max=self.num_element_classes - 1)
-        b_idx = torch.arange(B, device=cls_ids.device).view(B, 1, 1).expand(-1, S, S)
-        row_idx = gather_ids.view(B, S, 1).expand(-1, -1, S)
-        col_idx = gather_ids.view(B, 1, S).expand(-1, S, -1)
-        rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx] 
-        is_valid_obj = (map_ids >= 0)
-        valid_pair_mask = is_valid_obj.unsqueeze(2) & is_valid_obj.unsqueeze(1)
-        rel_ids = rel_ids.masked_fill(~valid_pair_mask, 0)
-        spatial_bias = self.spatial_bias_embedding(rel_ids) 
-        spatial_bias = spatial_bias.permute(0, 3, 1, 2).contiguous() 
-        return spatial_bias
+        _, M, N = kg_spatial_matrix.shape
+        
+        # Case A: Instance-based Matrix (T x T)
+        # 如果矩阵大小与序列长度 S 一致 (用于 Quantity Aware 模式)
+        if M == S and N == S:
+            rel_ids = kg_spatial_matrix
+            is_valid_obj = (cls_ids > 0)
+            valid_pair_mask = is_valid_obj.unsqueeze(2) & is_valid_obj.unsqueeze(1)
+            rel_ids = rel_ids.masked_fill(~valid_pair_mask, 0)
+            
+            spatial_bias = self.spatial_bias_embedding(rel_ids) 
+            spatial_bias = spatial_bias.permute(0, 3, 1, 2).contiguous() 
+            return spatial_bias
+
+        # Case B: Class-based Matrix (9 x 9) - Fallback
+        else:
+            map_ids = cls_ids - 2 
+            gather_ids = map_ids.clamp(min=0, max=self.num_element_classes - 1)
+            b_idx = torch.arange(B, device=cls_ids.device).view(B, 1, 1).expand(-1, S, S)
+            row_idx = gather_ids.view(B, S, 1).expand(-1, -1, S)
+            col_idx = gather_ids.view(B, 1, S).expand(-1, S, -1)
+            
+            row_idx = row_idx.clamp(max=M-1)
+            col_idx = col_idx.clamp(max=N-1)
+            
+            rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx] 
+            is_valid_obj = (map_ids >= 0)
+            valid_pair_mask = is_valid_obj.unsqueeze(2) & is_valid_obj.unsqueeze(1)
+            rel_ids = rel_ids.masked_fill(~valid_pair_mask, 0)
+            
+            spatial_bias = self.spatial_bias_embedding(rel_ids) 
+            spatial_bias = spatial_bias.permute(0, 3, 1, 2).contiguous() 
+            return spatial_bias
 
     def forward(self, input_ids, attention_mask, kg_class_ids, padding_mask, 
                 kg_spatial_matrix=None, location_grids=None, target_boxes=None):
@@ -268,16 +312,28 @@ class Poem2LayoutGenerator(nn.Module):
             pos_feat = pos_feat + handcrafted_pos
 
         if kg_spatial_matrix is not None:
+            # GNN Prior 也需要根据矩阵类型适配
+            # 如果是 TxT 矩阵，直接传入
+            # 如果是 9x9 矩阵，需要先 gather (类似于 construct_spatial_bias 的逻辑)
+            # 为了简单起见，我们假设 Dataset 已经做好了对齐 (TxT)
+            # 如果不是，GNN 的 forward 可能需要调整，或者在这里处理
+            # 鉴于 Dataset V6.0 已经输出 TxT 矩阵，直接传入即可
+            
+            # 安全检查维度
             B, T = kg_class_ids.shape
-            # 注意: gnn_prior 内部需要正确处理索引，这里我们传入原始 ids，由 construct_spatial_bias 负责处理
-            # 但 GNN 需要的是 spatial_matrix 中提取出的子图
-            # 这里复用 construct_spatial_bias 的逻辑来提取 seq_rel_ids
-            map_ids = kg_class_ids - 2 
-            gather_ids = map_ids.clamp(min=0, max=self.num_element_classes - 1)
-            b_idx = torch.arange(B, device=kg_class_ids.device).view(B, 1, 1).expand(-1, T, T)
-            row_idx = gather_ids.view(B, T, 1).expand(-1, -1, T)
-            col_idx = gather_ids.view(B, 1, T).expand(-1, T, -1)
-            seq_rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx]
+            _, M, N = kg_spatial_matrix.shape
+            
+            if M == T and N == T:
+                # 已经是 Instance Matrix
+                seq_rel_ids = kg_spatial_matrix
+            else:
+                # 还是 Class Matrix (9x9)，需要 gather
+                map_ids = kg_class_ids - 2 
+                gather_ids = map_ids.clamp(min=0, max=self.num_element_classes - 1)
+                b_idx = torch.arange(B, device=kg_class_ids.device).view(B, 1, 1).expand(-1, T, T)
+                row_idx = gather_ids.view(B, T, 1).expand(-1, -1, T).clamp(max=M-1)
+                col_idx = gather_ids.view(B, 1, T).expand(-1, T, -1).clamp(max=N-1)
+                seq_rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx]
             
             learned_pos = self.gnn_prior(content_embed, seq_rel_ids)
             pos_feat = pos_feat + learned_pos 
@@ -320,46 +376,29 @@ class Poem2LayoutGenerator(nn.Module):
                    sample=True):
         """
         RL 专用的前向传播。
-        Treats the network output as the Mean of a Gaussian policy.
         """
-        # 1. 复用原有的 forward 获取确定性的预测值 (作为 Gaussian 的均值 mu)
-        # 注意：这里我们不需要 target_boxes 来计算 VAE loss，只需生成
-        # forward 返回: mu, logvar, pred_boxes, decoder_output
         _, _, pred_boxes_mu, _ = self.forward(
             input_ids, attention_mask, kg_class_ids, padding_mask, 
             kg_spatial_matrix, location_grids, target_boxes=None
         )
         
-        # pred_boxes_mu: [B, T, 4] (sigmoid 后的 0-1 值)
-
         if not sample:
-            # Greedy 模式 (Baseline): 直接返回均值，不需要 log_prob
             return pred_boxes_mu, None
 
-        # 2. 构建高斯分布进行采样 (Exploration)
-        # 设定一个固定的探索方差，例如 0.1 (可以根据需要调整)
         std = torch.ones_like(pred_boxes_mu) * 0.1
         dist = torch.distributions.Normal(pred_boxes_mu, std)
         
-        # 3. 采样动作 (Action)
         action_boxes = dist.sample()
-        
-        # 4. 截断到 [0, 1] 范围 (因为是 Box 坐标)
         action_boxes = torch.clamp(action_boxes, 0.0, 1.0)
         
-        # 5. 计算 Log Probability (用于梯度回传)
-        # Sum over the last dimension (x,y,w,h) -> [B, T]
-        # 注意: clamp 可能会影响 log_prob 的准确性，但在简单应用中通常忽略边界效应
         log_prob = dist.log_prob(action_boxes).sum(dim=-1)
         
-        # Mask 掉 Padding 的部分
         if padding_mask is not None:
-             # padding_mask 为 True 的地方 log_prob 设为 0
              log_prob = log_prob.masked_fill(padding_mask, 0.0)
 
         return action_boxes, log_prob
 
-    def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None, kg_class_ids=None):
+    def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None, kg_class_ids=None, decoder_output=None):
         loss_mask = layout_mask 
         target_boxes = target_coords_gt
         
@@ -380,7 +419,6 @@ class Poem2LayoutGenerator(nn.Module):
         loss_area = F.smooth_l1_loss(pred_area, tgt_area, reduction='none')
         loss_area = (loss_area * loss_mask).sum() / num_valid
         
-        # [FIX] 传入 kg_class_ids 以便正确索引矩阵
         loss_relation = self._compute_relation_loss(pred_boxes, loss_mask, kg_spatial_matrix, kg_class_ids)
         loss_overlap = self._compute_overlap_loss(pred_boxes, loss_mask, kg_spatial_matrix, kg_class_ids)
         
@@ -391,6 +429,8 @@ class Poem2LayoutGenerator(nn.Module):
         
         loss_clustering = self._compute_clustering_loss(pred_boxes, loss_mask, kg_class_ids)
 
+        loss_consistency = self._compute_consistency_loss(decoder_output, loss_mask)
+
         total_loss = self.reg_loss_weight * loss_reg + \
                      self.iou_loss_weight * loss_iou + \
                      self.area_loss_weight * loss_area + \
@@ -399,11 +439,31 @@ class Poem2LayoutGenerator(nn.Module):
                      self.size_loss_weight * loss_size_prior + \
                      self.alignment_loss_weight * loss_alignment + \
                      self.balance_loss_weight * loss_balance + \
-                     self.clustering_loss_weight * loss_clustering
+                     self.clustering_loss_weight * loss_clustering + \
+                     self.consistency_loss_weight * loss_consistency 
                      
         return total_loss, loss_relation, loss_overlap, \
                loss_reg, loss_iou, loss_size_prior, loss_area, \
-               loss_alignment, loss_balance, loss_clustering
+               loss_alignment, loss_balance, loss_clustering, loss_consistency
+
+    def _compute_consistency_loss(self, decoder_output, mask):
+        if decoder_output is None:
+            return torch.tensor(0.0, device=mask.device)
+        
+        text_stream_feat = decoder_output[..., :self.hidden_size] 
+        layout_stream_feat = decoder_output[..., self.hidden_size:] 
+        
+        layout_projected = self.consistency_proj(layout_stream_feat) 
+        
+        text_norm = F.normalize(text_stream_feat, p=2, dim=-1)
+        layout_norm = F.normalize(layout_projected, p=2, dim=-1)
+        
+        cosine_sim = (text_norm * layout_norm).sum(dim=-1) 
+        loss = 1.0 - cosine_sim
+        
+        loss = (loss * mask).sum() / mask.sum().clamp(min=1)
+        
+        return loss
 
     def _compute_iou_loss(self, pred, target, mask):
         pred_x1 = pred[..., 0] - pred[..., 2] / 2
@@ -426,13 +486,17 @@ class Poem2LayoutGenerator(nn.Module):
         loss = (1.0 - iou) * mask
         return loss.sum() / (mask.sum().clamp(min=1))
 
-    # [FIXED] Added kg_class_ids and correct indexing
+    # [FIXED] Variable name: rel_id -> rel
     def _compute_relation_loss(self, pred_boxes, mask, kg_spatial_matrix, kg_class_ids):
         if kg_spatial_matrix is None or kg_class_ids is None:
             return torch.tensor(0.0, device=pred_boxes.device)
         loss = torch.tensor(0.0, device=pred_boxes.device)
         B, S, _ = pred_boxes.shape
         count = 0
+        
+        # [Compatible] 检查矩阵类型
+        is_instance_matrix = (kg_spatial_matrix.shape[1] == S)
+        
         for b in range(B):
             valid_indices = torch.nonzero(mask[b]).squeeze(1)
             if len(valid_indices) < 2: continue
@@ -440,35 +504,35 @@ class Poem2LayoutGenerator(nn.Module):
                 for j in valid_indices:
                     if i == j: continue
                     
-                    # [FIX] 使用 kg_class_ids 获取真实的类别 ID
-                    cid_i = kg_class_ids[b, i].item()
-                    cid_j = kg_class_ids[b, j].item()
-                    
-                    # [FIX] 映射到 0-8 的矩阵索引
-                    idx_i = int(cid_i) - 2
-                    idx_j = int(cid_j) - 2
-                    
-                    # 安全检查：索引必须在有效范围内
-                    if not (0 <= idx_i < 9 and 0 <= idx_j < 9):
-                        continue
+                    if is_instance_matrix:
+                        # 实例级矩阵：直接索引 (i, j)
+                        rel = kg_spatial_matrix[b, i, j].item()
+                    else:
+                        # 类别级矩阵：需映射
+                        cid_i = kg_class_ids[b, i].item()
+                        cid_j = kg_class_ids[b, j].item()
+                        idx_i = int(cid_i) - 2
+                        idx_j = int(cid_j) - 2
+                        if not (0 <= idx_i < 9 and 0 <= idx_j < 9): continue
+                        rel = kg_spatial_matrix[b, idx_i, idx_j].item()
                         
-                    rel_id = kg_spatial_matrix[b, idx_i, idx_j].item()
-                    if rel_id == 0: continue
+                    if rel == 0: continue
                     
                     box_a = pred_boxes[b, i]
                     box_b = pred_boxes[b, j]
                     
-                    if rel_id in [1, 5]: # ABOVE / ON_TOP
+                    # [Corrected Variable Name]
+                    if rel in [1, 5]: # ABOVE / ON_TOP
                         dist = box_a[1] - box_b[1] + 0.05
                         if dist > 0:
                             loss += dist
                             count += 1
-                    elif rel_id == 2: # BELOW
+                    elif rel == 2: # BELOW
                         dist = box_b[1] - box_a[1] + 0.05
                         if dist > 0:
                             loss += dist
                             count += 1
-                    elif rel_id == 3: # INSIDE
+                    elif rel == 3: # INSIDE
                         a_x1, a_y1 = box_a[0]-box_a[2]/2, box_a[1]-box_a[3]/2
                         a_x2, a_y2 = box_a[0]+box_a[2]/2, box_a[1]+box_a[3]/2
                         b_x1, b_y1 = box_b[0]-box_b[2]/2, box_b[1]-box_b[3]/2
@@ -482,11 +546,13 @@ class Poem2LayoutGenerator(nn.Module):
             return loss / count
         return loss
 
-    # [FIXED] Added kg_class_ids and correct indexing
     def _compute_overlap_loss(self, pred_boxes, mask, kg_spatial_matrix, kg_class_ids):
         loss = torch.tensor(0.0, device=pred_boxes.device)
         B, S, _ = pred_boxes.shape
         count = 0
+        
+        is_instance_matrix = (kg_spatial_matrix is not None and kg_spatial_matrix.shape[1] == S)
+        
         for b in range(B):
             valid_indices = torch.nonzero(mask[b]).squeeze(1)
             if len(valid_indices) < 2: continue
@@ -511,16 +577,18 @@ class Poem2LayoutGenerator(nn.Module):
                     for j_local, j_global in enumerate(valid_indices):
                         if i_local == j_local: continue
                         
-                        # [FIX] Correct indexing logic
-                        cid_i = kg_class_ids[b, i_global].item()
-                        cid_j = kg_class_ids[b, j_global].item()
-                        idx_i = int(cid_i) - 2
-                        idx_j = int(cid_j) - 2
-                        
-                        if not (0 <= idx_i < 9 and 0 <= idx_j < 9): continue
-                        
-                        rel = kg_spatial_matrix[b, idx_i, idx_j].item()
-                        if rel in [3, 4]: # INSIDE / SURROUNDS -> Allow overlap
+                        rel = 0
+                        if is_instance_matrix:
+                            rel = kg_spatial_matrix[b, i_global, j_global].item()
+                        else:
+                            cid_i = kg_class_ids[b, i_global].item()
+                            cid_j = kg_class_ids[b, j_global].item()
+                            idx_i = int(cid_i) - 2
+                            idx_j = int(cid_j) - 2
+                            if 0 <= idx_i < 9 and 0 <= idx_j < 9:
+                                rel = kg_spatial_matrix[b, idx_i, idx_j].item()
+                                
+                        if rel in [3, 4]: 
                             ignore_overlap[i_local, j_local] = True
                             ignore_overlap[j_local, i_local] = True
                             

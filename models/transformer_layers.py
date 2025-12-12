@@ -1,3 +1,5 @@
+# models/transformer_layers.py (V5.8: ADAPTIVE SPATIAL GATING)
+
 import math
 import torch
 import torch.nn as nn
@@ -73,10 +75,15 @@ class ContMultiHeadedAttention(nn.Module):
         self.q_layer = nn.Linear(size_q, num_heads * head_size_k) # Dh_q assumed same as Dh_k for matmul
         # Output layer maps back to the original V space
         self.output_layer = nn.Linear(num_heads * head_size_v, size_v)
+        
+        # [INNOVATION] Adaptive Spatial Gating Parameter
+        # 为每个 Head 学习一个门控生成器。输入是 Query 特征 (head_size_k)，输出是 1 个标量 (Gate)
+        self.gate_proj = nn.Linear(head_size_k, 1)
+        
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
 
-    # [MODIFIED] Added spatial_bias parameter
+    # [MODIFIED] Added spatial_bias parameter with Adaptive Gating
     def forward(self, k: Tensor, v: Tensor, q: Tensor, mask: Tensor = None, spatial_bias: Tensor = None):
         batch_size = k.size(0) # Assume batch_size is consistent across k, v, q
         num_heads = self.num_heads
@@ -92,14 +99,20 @@ class ContMultiHeadedAttention(nn.Module):
         v = v.view(batch_size, -1, num_heads, head_size_v).transpose(1, 2) # [B, H, L_v, Dh_v]
         q = q.view(batch_size, -1, num_heads, head_size_k).transpose(1, 2) # [B, H, L_q, Dh_k]
 
-        q = q / (head_size_k ** 0.5) # Scale
-        # Scores: [B, H, L_q, Dh_k] x [B, H, Dh_k, L_k] -> [B, H, L_q, L_k]
-        scores = torch.matmul(q, k.transpose(2, 3))
+        # Scale Dot-Product Attention
+        scores = torch.matmul(q, k.transpose(2, 3)) / (head_size_k ** 0.5) # [B, H, L_q, L_k]
         
-        # [NEW] Inject spatial bias
-        # spatial_bias shape expected: [B, H, L_q, L_k] or broadcastable
+        # [INNOVATION] Adaptive Spatial Gating Logic
         if spatial_bias is not None:
-            scores = scores + spatial_bias
+            # 1. 计算 Gate 值: [B, H, L_q, 1]
+            # 根据当前 Query 的特征，决定“空间先验”的重要性
+            # q shape: [B, H, L_q, Dh_k] -> gate shape: [B, H, L_q, 1]
+            gate = torch.sigmoid(self.gate_proj(q))
+            
+            # 2. 软注入 Spatial Bias
+            # spatial_bias: [B, H, L_q, L_k] (or broadcastable)
+            # 如果 Gate 接近 1，完全接受 KG 的建议；如果接近 0，则忽略它，避免干扰
+            scores = scores + gate * spatial_bias
 
         if mask is not None:
             # Handle different mask types (bool, int, float)
@@ -116,14 +129,18 @@ class ContMultiHeadedAttention(nn.Module):
                 scores = scores.masked_fill(~mask_expanded, float('-inf'))
             else:
                 scores = scores.masked_fill(mask_expanded == float('-inf'), float('-inf'))
+        
         attention = self.softmax(scores) # [B, H, L_q, L_k]
         attention = self.dropout(attention)
+        
         # Context: [B, H, L_q, L_k] x [B, H, L_v, Dh_v] -> [B, H, L_q, Dh_v] 
-        context = torch.matmul(attention, v) # [B, H, L_q, Dh_v]
+        context = torch.matmul(attention, v) 
+        
         # Reshape back: [B, H, L_q, Dh_v] -> [B, L_q, H * Dh_v]
         context = context.transpose(1, 2).contiguous().view(
-            batch_size, -1, num_heads * head_size_v) # [B, L_q, D_out] where D_out = H * Dh_v
-        output = self.output_layer(context) # [B, L_q, D_out] -> [B, L_q, size_v]
+            batch_size, -1, num_heads * head_size_v) 
+            
+        output = self.output_layer(context) # [B, L_q, size_v]
         return output
 
 class GELU(nn.Module):
@@ -210,6 +227,7 @@ class PoemLayoutDecoderLayer(nn.Module):
         
         # [MODIFIED] Pass spatial_bias to layout self-attention
         # This allows the model to attend to other layout elements based on their spatial relationship
+        # 现在，这里的调用会自动触发内部的 Adaptive Spatial Gating 逻辑
         layout_self_out = self.layout_self_attn(layout_norm1, layout_norm1, layout_norm1, mask=trg_mask, spatial_bias=spatial_bias)
         
         layout_self_out = self.dropout(layout_self_out) + layout_x # Residual: [B, T, bb_size]

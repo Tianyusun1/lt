@@ -1,7 +1,8 @@
-# File: tianyusun1/test2/test2-5.1/models/kg.py (V5.11: FIXED LTP UNPACKING BUG)
+# File: tianyusun1/test2/test2-5.1/models/kg.py (V6.0: QUANTITY AWARE EXPANSION + REGEX)
 
 import torch
 import os
+import re # [NEW] Needed for regex matching
 
 # 尝试导入 LTP
 try:
@@ -63,19 +64,23 @@ class PoetryKnowledgeGraph:
             'mountain': 2, 'water': 3, 'people': 4, 'tree': 5,
             'building': 6, 'bridge': 7, 'flower': 8, 'bird': 9, 'animal': 10
         }
+        
+        # [NEW] 为了方便正则匹配，我们需要一个中文关键词到 Class ID 的反向映射
+        self.keyword_to_class_id_map = {} 
+        
         self.num_classes = 9 
         
         self.visual_synonyms = self._init_visual_synonyms()
         self._build_knowledge_graph()
         self._build_lookup_tables()
 
-        # === 3. 数量词典 ===
+        # === 3. 数量词典 (V6.0 Enhanced) ===
         self.QUANTITY_MAP = {
             # 数词/量词
             '两': 2, '双': 2, '二': 2, '对': 2, '偶': 2, '并': 2, '一': 1,
-            '三': 3, '数': 3, '群': 3, '满': 3, '千': 3, '万': 3, '众': 3, '百': 3, '多': 3, '遍': 3,
+            '三': 3, '数': 3, '群': 3, '满': 3, '千': 3, '万': 3, '众': 3, '百': 3, '多': 3, '遍': 3, 
             # 形容词/状态词 (针对山水)
-            '重': 2, '复': 2 
+            '重': 2, '复': 2, '孤': 1, '独': 1, '单': 1
         }
 
         # 空间关系与先验
@@ -236,6 +241,7 @@ class PoetryKnowledgeGraph:
     def _build_lookup_tables(self):
         self.keyword_to_class_id = {}
         self.scene_to_implied_ids = {}
+        
         for head, rel, tail in self.triplets:
             if rel == 'links_to':
                 cls_id = self.get_visual_class_id(tail)
@@ -249,6 +255,9 @@ class PoetryKnowledgeGraph:
                     cls_id = self.get_visual_class_id(elem)
                     if cls_id:
                         self.scene_to_implied_ids[head].add(cls_id)
+        
+        # [NEW] 同时也保留 keyword -> class_id 的直接映射，方便正则使用
+        self.keyword_to_class_id_map = self.keyword_to_class_id
 
     def get_visual_class_id(self, visual_entity):
         if visual_entity in self.visual_class_mapping:
@@ -279,182 +288,208 @@ class PoetryKnowledgeGraph:
                             visual_vector[idx] = 0.5 
         return visual_vector
 
-    def extract_spatial_matrix(self, poem_text: str) -> torch.Tensor:
-        num_classes = 9
-        relation_matrix = torch.zeros((num_classes, num_classes), dtype=torch.long)
-        feature_vec = self.extract_visual_feature_vector(poem_text)
-        present_indices = [i for i, val in enumerate(feature_vec) if val > 0]
+    def extract_spatial_matrix(self, poem_text: str, obj_ids=None) -> torch.Tensor:
+        """
+        提取空间关系矩阵 [T, T]。
+        支持两种模式：
+        1. obj_ids is None: 返回 9x9 的类间关系矩阵 (训练/验证用)。
+        2. obj_ids Provided: 返回 TxT 的实例间关系矩阵 (推理/数量感知用)。
+        """
         
-        for idx_a in present_indices:
-            for idx_b in present_indices:
-                if idx_a == idx_b: continue
-                cls_a = idx_a + 2
-                cls_b = idx_b + 2
-                if (cls_a, cls_b) in self.static_priors:
-                    relation_matrix[idx_a, idx_b] = self.static_priors[(cls_a, cls_b)]
+        # Case 1: 默认的 9x9 逻辑 (训练兼容)
+        if obj_ids is None:
+            num_classes = 9
+            relation_matrix = torch.zeros((num_classes, num_classes), dtype=torch.long)
+            feature_vec = self.extract_visual_feature_vector(poem_text)
+            present_indices = [i for i, val in enumerate(feature_vec) if val > 0]
+            
+            for idx_a in present_indices:
+                for idx_b in present_indices:
+                    if idx_a == idx_b: continue
+                    cls_a = idx_a + 2
+                    cls_b = idx_b + 2
+                    if (cls_a, cls_b) in self.static_priors:
+                        relation_matrix[idx_a, idx_b] = self.static_priors[(cls_a, cls_b)]
 
-        if '高' in poem_text and '树' in poem_text:
-            tree_idx = 5 - 2 
-            if tree_idx in present_indices:
-                for other_idx in present_indices:
-                    if other_idx != tree_idx and (other_idx + 2) != 2: 
-                        relation_matrix[tree_idx, other_idx] = self.RELATION_IDS['above']
+            # [保留原有的关键词判断逻辑]
+            if '高' in poem_text and '树' in poem_text:
+                tree_idx = 5 - 2 
+                if tree_idx in present_indices:
+                    for other_idx in present_indices:
+                        if other_idx != tree_idx and (other_idx + 2) != 2: 
+                            relation_matrix[tree_idx, other_idx] = self.RELATION_IDS['above']
 
-        if ('幽' in poem_text or '深' in poem_text) and '山' in poem_text:
-            mtn_idx = 2 - 2 
-            if mtn_idx in present_indices:
-                for other_idx in present_indices:
-                    if other_idx != mtn_idx:
-                        relation_matrix[other_idx, mtn_idx] = self.RELATION_IDS['inside']
-
-        boat_words = ['舟', '船', '舫']
-        if any(w in poem_text for w in boat_words):
-            ppl_idx = 4 - 2 
-            water_idx = 3 - 2 
-            if ppl_idx in present_indices and water_idx in present_indices:
-                relation_matrix[ppl_idx, water_idx] = self.RELATION_IDS['inside']
-
-        sky_words = ['月', '星', '日', '阳']
-        if any(w in poem_text for w in sky_words):
-            mtn_idx = 2 - 2 
-            if mtn_idx in present_indices:
-                for other_idx in present_indices:
-                    if other_idx != mtn_idx:
-                        relation_matrix[mtn_idx, other_idx] = self.RELATION_IDS['above']
-
-        if '绕' in poem_text or '缠' in poem_text or '围' in poem_text:
-            flower_idx = 8 - 2 
-            tree_idx = 5 - 2 
-            if flower_idx in present_indices and tree_idx in present_indices:
-                relation_matrix[flower_idx, tree_idx] = self.RELATION_IDS['surrounds']
-            water_idx = 3 - 2 
-            bldg_idx = 6 - 2 
-            mtn_idx = 2 - 2 
-            if water_idx in present_indices:
-                if bldg_idx in present_indices:
-                    relation_matrix[water_idx, bldg_idx] = self.RELATION_IDS['surrounds']
+            if ('幽' in poem_text or '深' in poem_text) and '山' in poem_text:
+                mtn_idx = 2 - 2 
                 if mtn_idx in present_indices:
-                    relation_matrix[water_idx, mtn_idx] = self.RELATION_IDS['surrounds']
+                    for other_idx in present_indices:
+                        if other_idx != mtn_idx:
+                            relation_matrix[other_idx, mtn_idx] = self.RELATION_IDS['inside']
 
-        if '满' in poem_text or '遍' in poem_text:
-            flower_idx = 8 - 2
-            mtn_idx = 2 - 2 
-            if flower_idx in present_indices and mtn_idx in present_indices:
-                relation_matrix[flower_idx, mtn_idx] = self.RELATION_IDS['inside']
+            boat_words = ['舟', '船', '舫']
+            if any(w in poem_text for w in boat_words):
+                ppl_idx = 4 - 2 
+                water_idx = 3 - 2 
+                if ppl_idx in present_indices and water_idx in present_indices:
+                    relation_matrix[ppl_idx, water_idx] = self.RELATION_IDS['inside']
 
-        if '松下' in poem_text or '树下' in poem_text or '林下' in poem_text:
-            tree_idx = 5 - 2
-            if tree_idx in present_indices:
-                for other_idx in present_indices:
-                    if other_idx != tree_idx:
-                        if (other_idx + 2) != 9: 
-                            relation_matrix[other_idx, tree_idx] = self.RELATION_IDS['below']
+            sky_words = ['月', '星', '日', '阳']
+            if any(w in poem_text for w in sky_words):
+                mtn_idx = 2 - 2 
+                if mtn_idx in present_indices:
+                    for other_idx in present_indices:
+                        if other_idx != mtn_idx:
+                            relation_matrix[mtn_idx, other_idx] = self.RELATION_IDS['above']
 
-        fly_over_words = ['飞过', '掠', '渡', '过', '翔']
-        if any(w in poem_text for w in fly_over_words):
-            bird_idx = 9 - 2 
-            if bird_idx in present_indices:
-                for other_idx in present_indices:
-                    if (other_idx + 2) in [3, 2]:
-                        relation_matrix[bird_idx, other_idx] = self.RELATION_IDS['above']
+            if '绕' in poem_text or '缠' in poem_text or '围' in poem_text:
+                flower_idx = 8 - 2 
+                tree_idx = 5 - 2 
+                if flower_idx in present_indices and tree_idx in present_indices:
+                    relation_matrix[flower_idx, tree_idx] = self.RELATION_IDS['surrounds']
+                water_idx = 3 - 2 
+                bldg_idx = 6 - 2 
+                mtn_idx = 2 - 2 
+                if water_idx in present_indices:
+                    if bldg_idx in present_indices:
+                        relation_matrix[water_idx, bldg_idx] = self.RELATION_IDS['surrounds']
+                    if mtn_idx in present_indices:
+                        relation_matrix[water_idx, mtn_idx] = self.RELATION_IDS['surrounds']
 
-        return relation_matrix
+            if '满' in poem_text or '遍' in poem_text:
+                flower_idx = 8 - 2
+                mtn_idx = 2 - 2 
+                if flower_idx in present_indices and mtn_idx in present_indices:
+                    relation_matrix[flower_idx, mtn_idx] = self.RELATION_IDS['inside']
 
-    # [MODIFIED V5.11] 增强鲁棒性的 LTP 依存解析 (修复解包错误)
+            if '松下' in poem_text or '树下' in poem_text or '林下' in poem_text:
+                tree_idx = 5 - 2
+                if tree_idx in present_indices:
+                    for other_idx in present_indices:
+                        if other_idx != tree_idx:
+                            if (other_idx + 2) != 9: 
+                                relation_matrix[other_idx, tree_idx] = self.RELATION_IDS['below']
+
+            fly_over_words = ['飞过', '掠', '渡', '过', '翔']
+            if any(w in poem_text for w in fly_over_words):
+                bird_idx = 9 - 2 
+                if bird_idx in present_indices:
+                    for other_idx in present_indices:
+                        if (other_idx + 2) in [3, 2]:
+                            relation_matrix[bird_idx, other_idx] = self.RELATION_IDS['above']
+
+            return relation_matrix
+
+        else:
+            # Case 2: 基于实例的矩阵构建 (推理用)
+            T = len(obj_ids)
+            matrix = torch.zeros((T, T), dtype=torch.long)
+            
+            for i in range(T):
+                for j in range(T):
+                    if i == j: continue
+                    id_i = obj_ids[i]
+                    id_j = obj_ids[j]
+                    
+                    # 规则 1: 鸟/人 (4,9) 在 山/水/楼 (2,3,6) 附近或上面
+                    if id_i in [4, 9] and id_j in [2, 3, 6]:
+                        matrix[i, j] = self.RELATION_IDS['inside'] 
+                        matrix[j, i] = self.RELATION_IDS['surrounds']
+                        
+                        if '上' in poem_text or '飞' in poem_text:
+                            matrix[i, j] = self.RELATION_IDS['above']
+                            matrix[j, i] = self.RELATION_IDS['below']
+                    
+                    # 规则 2: 同类物体 -> 互为 NEARBY (6)
+                    if id_i == id_j:
+                        matrix[i, j] = self.RELATION_IDS['near']
+                        matrix[j, i] = self.RELATION_IDS['near']
+            
+            return matrix
+
     def expand_ids_with_quantity(self, unique_class_ids, poem):
         """
-        使用 LTP 分析句子依存关系，精准判断数量修饰对象。
-        增加了对 deps 格式的兼容性检查。
+        [INNOVATION] 数量感知扩展 (V6.0: Enhanced with Regex)
+        结合 LTP 依存分析 和 正则表达式/规则匹配，解决 "千峰" 等问题。
         """
-        if self.ltp is None:
-            return unique_class_ids
-
-        # 1. LTP 推理
-        try:
-            output = self.ltp.pipeline([poem], tasks=["cws", "pos", "dep"])
-            words = output.cws[0] 
-            deps = output.dep[0]  
-        except Exception:
-            return unique_class_ids
-
-        # 2. 找到物体词索引
-        object_locs = {}
-        for cid in unique_class_ids:
-            object_locs[cid] = []
-            
-        for i, w in enumerate(words):
-            for kw, cid in self.keyword_to_class_id.items():
-                if cid in unique_class_ids and kw in w: 
-                    object_locs[cid].append(i)
-                    break 
-
-        # 3. 依存树搜索
+        
         final_counts = {cid: 1 for cid in unique_class_ids}
-        debug_info = []
-
-        for cid, word_indices in object_locs.items():
-            best_multiplier = 1
-            
-            for obj_idx in word_indices:
-                # 遍历所有词的依存关系
-                for mod_idx, dep_item in enumerate(deps):
+        
+        # === 策略 A: 基于规则/正则的暴力匹配 (优先级高) ===
+        # 专门处理 "千峰", "万木", "双燕" 这种紧密结合的词
+        for kw, cid in self.keyword_to_class_id.items():
+            if cid in unique_class_ids and kw in poem:
+                # 遍历所有数量词
+                for q_char, q_val in self.QUANTITY_MAP.items():
+                    # 模式 1: 量词+名词 (e.g., "千山", "双燕")
+                    if f"{q_char}{kw}" in poem:
+                        final_counts[cid] = max(final_counts[cid], q_val)
                     
-                    # [FIX] 兼容性处理：不同版本的 LTP 返回格式可能不同 (tuple vs dict)
-                    if isinstance(dep_item, dict):
-                        head_idx = dep_item.get('head', 0)
-                        label = dep_item.get('label', '')
-                    elif isinstance(dep_item, (list, tuple)) and len(dep_item) >= 2:
-                        head_idx = dep_item[0]
-                        label = dep_item[1]
-                    else:
-                        continue # 跳过无法解析的格式
+                    # 模式 2: 量词+形容词+名词 (e.g., "数点梅花")
+                    # 使用正则搜索: q_char + (1-2个任意字) + kw
+                    pattern = f"{q_char}.{{0,2}}{kw}"
+                    if re.search(pattern, poem):
+                        final_counts[cid] = max(final_counts[cid], q_val)
 
-                    # head_idx 在 LTP 中是 1-based
-                    if head_idx == 0: continue
-                    parent = head_idx - 1
-                    
-                    # Case 1: Modifier -> Head (例如: "两" -> "鸟", label='ATT'/'QUN')
-                    if parent == obj_idx:
-                        modifier_word = words[mod_idx]
-                        if modifier_word in self.QUANTITY_MAP:
-                            best_multiplier = max(best_multiplier, self.QUANTITY_MAP[modifier_word])
-                        
-                        # 递归检查子节点
-                        for sub_mod_idx, sub_item in enumerate(deps):
-                            # [FIX] 同样的兼容性处理
-                            if isinstance(sub_item, dict):
-                                sub_head = sub_item.get('head', 0)
-                            elif isinstance(sub_item, (list, tuple)) and len(sub_item) >= 1:
-                                sub_head = sub_item[0]
+        # === 策略 B: LTP 依存分析 (用于处理复杂句法) ===
+        if self.ltp is not None:
+            try:
+                output = self.ltp.pipeline([poem], tasks=["cws", "pos", "dep"])
+                words = output.cws[0] 
+                deps = output.dep[0]
+                
+                # 找到物体词索引
+                object_locs = {}
+                for cid in unique_class_ids:
+                    object_locs[cid] = []
+                
+                for i, w in enumerate(words):
+                    for kw, cid in self.keyword_to_class_id.items():
+                        if cid in unique_class_ids and kw in w: 
+                            object_locs[cid].append(i)
+                            break 
+
+                for cid, word_indices in object_locs.items():
+                    best_multiplier = 1
+                    for obj_idx in word_indices:
+                        for mod_idx, dep_item in enumerate(deps):
+                            # [FIX] LTP 格式兼容
+                            if isinstance(dep_item, dict):
+                                head_idx = dep_item.get('head', 0)
+                                label = dep_item.get('label', '')
+                            elif isinstance(dep_item, (list, tuple)) and len(dep_item) >= 2:
+                                head_idx = dep_item[0]
+                                label = dep_item[1]
                             else:
-                                continue
-                                
-                            if sub_head - 1 == mod_idx:
-                                sub_word = words[sub_mod_idx]
-                                if sub_word in self.QUANTITY_MAP:
-                                    best_multiplier = max(best_multiplier, self.QUANTITY_MAP[sub_word])
+                                continue 
 
-                    # Case 2: Subject -> Head (例如: "山" -> "重", label='SBV')
-                    if mod_idx == obj_idx: 
-                        head_word = words[parent]
-                        if head_word in self.QUANTITY_MAP:
-                            if label == 'SBV':
-                                best_multiplier = max(best_multiplier, self.QUANTITY_MAP[head_word])
-
-            final_counts[cid] = max(final_counts[cid], best_multiplier)
+                            if head_idx == 0: continue
+                            parent = head_idx - 1
+                            
+                            # Modifier -> Head
+                            if parent == obj_idx:
+                                modifier_word = words[mod_idx]
+                                if modifier_word in self.QUANTITY_MAP:
+                                    best_multiplier = max(best_multiplier, self.QUANTITY_MAP[modifier_word])
+                    
+                    final_counts[cid] = max(final_counts[cid], best_multiplier)
+            
+            except Exception as e:
+                # print(f"[Warning] LTP parsing failed: {e}")
+                pass
 
         # 4. 生成结果
         expanded_ids = []
+        debug_info = []
+        
         for cid, count in final_counts.items():
-            count = min(count, 3) 
+            count = min(count, 5) # [FIX] 限制上限为 5，防止爆显存
             if count > 1:
                 debug_info.append(f"Class {cid} x{count}")
             for _ in range(count):
                 expanded_ids.append(cid)
                 
         if debug_info:
-            # 简化打印，避免干扰进度条
-            # print(f"  [KG-LTP] '{poem[:10]}...' -> {', '.join(debug_info)}")
+            # print(f"  [Quantity] '{poem[:10]}...' -> {', '.join(debug_info)}")
             pass
             
         return expanded_ids
@@ -467,15 +502,13 @@ if __name__ == "__main__":
     test_poems = [
         "两只黄鹂鸣翠柳", 
         "山重水复疑无路",
-        "柳暗花明又一村"
+        "柳暗花明又一村",
+        "千峰万壑"
     ]
     
-    print("\n--- Testing LTP Logic ---")
-    if pkg.ltp:
-        for p in test_poems:
-            vec = pkg.extract_visual_feature_vector(p)
-            ids = [i+2 for i, v in enumerate(vec) if v > 0]
-            expanded = pkg.expand_ids_with_quantity(ids, p)
-            print(f"Poem: {p} -> IDs: {ids} -> Expanded: {expanded}")
-    else:
-        print("LTP not loaded, skipping tests.")
+    print("\n--- Testing Quantity Logic ---")
+    for p in test_poems:
+        vec = pkg.extract_visual_feature_vector(p)
+        ids = [i+2 for i, v in enumerate(vec) if v > 0]
+        expanded = pkg.expand_ids_with_quantity(ids, p)
+        print(f"Poem: {p} -> IDs: {ids} -> Expanded: {expanded}")

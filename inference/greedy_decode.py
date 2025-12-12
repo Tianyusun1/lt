@@ -1,8 +1,8 @@
-# File: tianyusun1/test2/test2-5.1/inference/greedy_decode.py (V5.3: QUANTITY AWARE + JITTER)
+# File: tianyusun1/test2/test2-5.1/inference/greedy_decode.py (V5.9: ADAPTIVE GATING + JITTER + SHAPE PRIORS)
 
 import torch
 import numpy as np
-import random # [NEW] Needed for jitter logic
+import random 
 
 # --- Import KG & Location ---
 try:
@@ -11,7 +11,7 @@ except ImportError:
     print("[Error] Could not import PoetryKnowledgeGraph. Make sure models/kg.py is accessible.")
     PoetryKnowledgeGraph = None
 
-# 导入位置生成器 (V4.5+ Gaussian Support)
+# 导入位置生成器
 try:
     from models.location import LocationSignalGenerator
 except ImportError:
@@ -19,7 +19,7 @@ except ImportError:
     LocationSignalGenerator = None
 # -----------------
 
-# [NEW V5.2] 定义所有类别的形状先验 (Shape Priors)
+# [V5.2] 定义所有类别的形状先验 (Shape Priors)
 # 防止物体塌缩或形状畸形。这些是物理/常识约束。
 # 2:mtn, 3:water, 4:ppl, 5:tree, 6:bldg, 7:bridge, 8:flower, 9:bird, 10:animal
 CLASS_SHAPE_PRIORS = {
@@ -46,6 +46,7 @@ CLASS_SHAPE_PRIORS = {
 def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, device='cuda', mode='greedy', top_k=3):
     """
     Query-Based decoding with Location Guidance & CVAE Diversity.
+    [Updated] Supports Adaptive Knowledge Gating (Innovation 1).
     """
     if PoetryKnowledgeGraph is None:
         return []
@@ -64,19 +65,18 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     
     # 2. KG 提取内容 (含数量扩展逻辑)
     kg_vector = pkg.extract_visual_feature_vector(poem)
-    existing_indices = torch.nonzero(kg_vector > 0).squeeze(1)
+    existing_indices = torch.nonzero(torch.tensor(kg_vector) > 0).squeeze(1)
     raw_class_ids = (existing_indices + 2).tolist()
     
     if not raw_class_ids:
         return []
         
     # [MODIFIED] 调用 KG 进行数量扩展 (解决"两只鸟"等问题)
-    # 需确保 models/kg.py 已更新包含此方法
     if hasattr(pkg, 'expand_ids_with_quantity'):
         kg_class_ids = pkg.expand_ids_with_quantity(raw_class_ids, poem)
         # [验证输出]
         if len(kg_class_ids) > len(raw_class_ids):
-            print(f"[Infer Debug] Quantity Rules Applied: {raw_class_ids} -> {kg_class_ids}")
+            pass # print(f"[Infer Debug] Quantity Rules Applied: {raw_class_ids} -> {kg_class_ids}")
     else:
         kg_class_ids = raw_class_ids
         
@@ -87,8 +87,21 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     # 3. 准备模型输入 Tensor
     kg_class_tensor = torch.tensor([kg_class_ids], dtype=torch.long).to(device)
     
-    kg_spatial_matrix_raw = pkg.extract_spatial_matrix(poem)
-    kg_spatial_matrix = kg_spatial_matrix_raw.unsqueeze(0).to(device) 
+    # [CRITICAL UPDATE for Innovation 1]
+    # 必须在此处提取并构建 spatial_matrix，否则模型中的 Gate 无法激活
+    # extract_spatial_matrix 应该接受 text 和 ordered_class_ids
+    # 注意：这里我们传入 kg_class_ids (可能包含重复物体，如两只鸟)
+    # 如果 pkg.extract_spatial_matrix 不支持 list 输入，需要确保它能处理
+    try:
+        # 假设 pkg 支持传入 class_ids 列表来构建特定实例间的矩阵
+        # 如果不支持，您可能需要修改 pkg 或退回到基于 raw_ids 的矩阵然后扩展
+        # 这里假设 extract_spatial_matrix(text, obj_ids=...) 是可用的
+        kg_spatial_matrix_np = pkg.extract_spatial_matrix(poem, obj_ids=kg_class_ids)
+    except TypeError:
+        # Fallback: 如果不支持 obj_ids 参数，使用默认方法 (可能不准确)
+        kg_spatial_matrix_np = pkg.extract_spatial_matrix(poem)
+        
+    kg_spatial_matrix = torch.tensor(kg_spatial_matrix_np, dtype=torch.long).unsqueeze(0).to(device)
     
     # === 生成位置引导信号 (含 Jitter) ===
     location_grids_tensor = None
@@ -97,13 +110,15 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
         current_occupancy = torch.zeros((8, 8), dtype=torch.float32)
         grids_list = []
         
+        # 即使 kg_spatial_matrix_raw 没用到，我们也可以用 kg_spatial_matrix_np 来辅助
+        # 这里为了位置生成，主要依赖 spatial_matrix 的行列
+        # 注意：kg_spatial_matrix_np 是 [T, T]
+        
         for i, cls_id in enumerate(kg_class_ids):
-            # Class ID (2-10) -> Matrix Index (0-8)
-            matrix_idx = int(cls_id) - 2
-            if matrix_idx < 0 or matrix_idx >= 9: matrix_idx = 0 # Safety
-            
-            row = kg_spatial_matrix_raw[matrix_idx]
-            col = kg_spatial_matrix_raw[:, matrix_idx]
+            # 获取该物体与其他物体的关系行/列 (来自我们刚刚构建的矩阵)
+            # 这样即使是第2只鸟，也能获得正确的关系上下文
+            row = kg_spatial_matrix_np[i]
+            col = kg_spatial_matrix_np[:, i]
             
             signal, current_occupancy = location_gen.infer_stateful_signal(
                 i, row, col, current_occupancy, 
@@ -111,19 +126,12 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
             )
             
             # [NEW V5.3] 引入位置抖动 (Jitter)
-            # 打破 "Location Grid 总是指向正中间" 的先验偏差
-            # 仅在 sample 模式下启用，保持 greedy 的确定性
             shift_val = 0
             if mode == 'sample':
                 if random.random() < 0.6: # 60% 概率发生偏移
                     shift_val = random.randint(-2, 2)
                     signal = torch.roll(signal, shifts=shift_val, dims=1)
             
-            if shift_val != 0:
-                # 可选：打印调试信息
-                # print(f"[Infer Debug] Obj {i} (Class {cls_id}): Jitter shift {shift_val}")
-                pass
-
             grids_list.append(signal)
             
         location_grids_tensor = torch.stack(grids_list).unsqueeze(0).to(device)
@@ -138,12 +146,13 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     
     # 4. 单次前向传播
     with torch.no_grad():
+        # [UPDATED] Unpack 4 values (decoder_output added in V5.7)
         _, _, pred_boxes, _ = model(
             input_ids=input_ids, 
             attention_mask=attention_mask, 
             kg_class_ids=kg_class_tensor, 
             padding_mask=padding_mask, 
-            kg_spatial_matrix=kg_spatial_matrix,
+            kg_spatial_matrix=kg_spatial_matrix, # 传入矩阵以激活 Gate
             location_grids=location_grids_tensor
         )
         

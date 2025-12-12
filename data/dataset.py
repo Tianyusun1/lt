@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.1/data/dataset.py (V5.3: ENHANCED AUGMENTATION + JITTER + QUANTITY AWARE)
+# File: tianyusun1/test2/test2-5.1/data/dataset.py (V6.0: QUANTITY EXPANSION + DYNAMIC MATRIX)
 
 import os
 import torch
@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 from transformers import BertTokenizer
 from typing import List, Tuple, Dict, Optional
 import numpy as np 
-import random # [NEW] Needed for jitter
+import random 
 
 # --- 导入知识图谱模型 ---
 from models.kg import PoetryKnowledgeGraph
@@ -56,7 +56,7 @@ class PoegraphLayoutDataset(Dataset):
         self.pkg = PoetryKnowledgeGraph()
         print("✅ Knowledge Graph initialized.")
         
-        # [MODIFIED] 初始化位置信号生成器 (8x8)
+        # 初始化位置信号生成器 (8x8)
         self.location_gen = LocationSignalGenerator(grid_size=8)
         print("✅ Location Signal Generator (8x8) initialized.")
         
@@ -115,81 +115,46 @@ class PoegraphLayoutDataset(Dataset):
             return_tensors='pt'
         )
 
-        # 2. KG 提取内容 (Query Generation)
-        # extract_visual_feature_vector 返回 [9] 的 multi-hot
-        kg_vector = self.pkg.extract_visual_feature_vector(poem)
-        kg_spatial_matrix = self.pkg.extract_spatial_matrix(poem)
+        # ---------------------------------------------------------
+        # 2. KG 推理 & 数量扩展 (Quantity Expansion)
+        # ---------------------------------------------------------
+        # A. 基础提取 (Base Extraction)
+        kg_vector = self.pkg.extract_visual_feature_vector(poem) # [9] multi-hot
+        raw_indices = torch.nonzero(kg_vector > 0).squeeze(1).tolist()
+        raw_ids = [i + 2 for i in raw_indices]
         
-        # 获取原始去重 ID
-        existing_indices = torch.nonzero(kg_vector > 0).squeeze(1)
-        raw_ids = (existing_indices + 2).tolist()
+        # B. [INNOVATION] 数量扩展
+        # "千峰" -> [Mountain, Mountain, Mountain, ...]
+        if not raw_ids:
+            expanded_ids = []
+        else:
+            expanded_ids = self.pkg.expand_ids_with_quantity(raw_ids, poem)
+            
+        # C. 截断 (Truncate)
+        if len(expanded_ids) > self.max_layout_length:
+            expanded_ids = expanded_ids[:self.max_layout_length]
+            
+        num_boxes = len(expanded_ids)
         
-        # [MODIFIED] 调用 KG 进行数量扩展 (解决"两只鸟"等问题)
-        kg_class_ids = self.pkg.expand_ids_with_quantity(raw_ids, poem)
-        
-        # [验证输出] 随机打印变长样本以验证逻辑 (5% 概率)
-        if len(kg_class_ids) > len(raw_ids) and random.random() < 0.05: 
-            print(f"\n[Dataset Debug] ID Expansion Triggered!")
-            print(f"  Poem: {poem}")
-            print(f"  Original IDs: {raw_ids}")
-            print(f"  Expanded IDs: {kg_class_ids}")
+        # [验证输出] 随机打印变长样本 (仅调试用)
+        if len(expanded_ids) > len(raw_ids) and random.random() < 0.01: 
+            print(f"\n[Dataset Debug] ID Expansion: {raw_ids} -> {expanded_ids} ('{poem}')")
 
-        # [B] 权重列表 (1.0 or 0.5)
-        # 由于 ID 列表变长了，需要重新匹配权重
-        kg_class_weights = []
-        for cid in kg_class_ids:
-             # 从原始 vector 查权重，找不到默认为 1.0 (通常不会发生，除非扩展逻辑有问题)
-             idx = int(cid) - 2
-             if 0 <= idx < self.num_classes:
-                 kg_class_weights.append(kg_vector[idx].item())
-             else:
-                 kg_class_weights.append(1.0)
+        # ---------------------------------------------------------
+        # 3. 提取空间关系矩阵 (Instance-level Spatial Matrix)
+        # ---------------------------------------------------------
+        # [INNOVATION] 生成 T x T 的实例关系矩阵
+        if num_boxes > 0:
+            spatial_matrix = self.pkg.extract_spatial_matrix(poem, obj_ids=expanded_ids)
+        else:
+            spatial_matrix = torch.zeros((0, 0), dtype=torch.long)
 
-        if not kg_class_ids:
-            kg_class_ids = [0]
-            kg_class_weights = [0.0]
-
-        # === [MODIFIED] 生成位置引导信号 (Location Grids - Stateful) ===
-        # 初始化画布状态 (8x8)
-        current_occupancy = torch.zeros((8, 8), dtype=torch.float32) 
-        location_grids_list = [] 
-        
-        # 遍历生成的 Queries (kg_class_ids)
-        for i, cls_id in enumerate(kg_class_ids):
-            cls_id = int(cls_id)
-            if cls_id == 0: # PAD
-                location_grids_list.append(torch.zeros((8, 8), dtype=torch.float32))
-                continue
-                
-            # Class ID (2-10) -> Matrix Index (0-8)
-            matrix_idx = cls_id - 2
-            # 保护索引越界
-            if matrix_idx < 0 or matrix_idx >= self.num_classes:
-                matrix_idx = 0
-            
-            # 获取该物体在 KG 中的空间关系
-            spatial_row = kg_spatial_matrix[matrix_idx]  
-            spatial_col = kg_spatial_matrix[:, matrix_idx] 
-            
-            # 调用 location_gen 进行有状态推理
-            # [V5.3] 训练阶段引入随机性 (Sample 模式)
-            signal, current_occupancy = self.location_gen.infer_stateful_signal(
-                i, spatial_row, spatial_col, current_occupancy,
-                mode='sample', top_k=3 
-            )
-            
-            # [V5.3] 随机水平平移 (Horizontal Jitter) - 防止居中死板
-            if random.random() < 0.7: 
-                shift = random.randint(-2, 2) 
-                signal = torch.roll(signal, shifts=shift, dims=1) 
-            
-            location_grids_list.append(signal)
-            
-        # =======================================================
-
-        # 3. GT 对齐与清洗 (Alignment & Cleaning Logic)
+        # ---------------------------------------------------------
+        # 4. GT 对齐与构建 (Alignment & Target Construction)
+        # ---------------------------------------------------------
         target_boxes = []
-        loss_mask = [] # 1.0: 有效GT, 0.0: 无GT或脏数据
+        loss_mask = [] 
+        kg_class_weights = []
 
         # 将 GT 按类别分组
         gt_dict = {}
@@ -199,33 +164,36 @@ class PoegraphLayoutDataset(Dataset):
             if cid not in gt_dict: gt_dict[cid] = []
             gt_dict[cid].append([cx, cy, w, h])
 
-        # [NEW] 全局数据增强决策 (Flip Augmentation)
+        # 全局数据增强决策
         do_flip = random.random() < 0.5
         
-        # 遍历 KG 要求的每个物体 (这里 kg_class_ids 已经包含重复项，例如 [9, 9])
-        for k_cls in kg_class_ids:
+        # 遍历扩展后的 IDs
+        for i, k_cls in enumerate(expanded_ids):
             k_cls = int(k_cls)
-            if k_cls == 0: # PAD
-                target_boxes.append([0.0, 0.0, 0.0, 0.0])
-                loss_mask.append(0.0)
-                continue
+            
+            # 设置权重 (简单处理：存在即为 1.0)
+            idx = k_cls - 2
+            if 0 <= idx < self.num_classes:
+                kg_class_weights.append(kg_vector[idx].item())
+            else:
+                kg_class_weights.append(1.0)
 
-            # 如果 GT 中有该类别的框，则取出一个 (pop)
+            # 尝试分配 GT Box
             if k_cls in gt_dict and len(gt_dict[k_cls]) > 0:
                 box = gt_dict[k_cls].pop(0) # [cx, cy, w, h]
                 
-                # === [NEW] 脏数据过滤逻辑 ===
-                if box[2] * box[3] > 0.90:
+                # === 脏数据过滤 ===
+                if box[2] * box[3] > 0.90: # 太大
                     target_boxes.append([0.0, 0.0, 0.0, 0.0])
                     loss_mask.append(0.0) 
                     continue
                 
                 aspect_ratio = box[2] / (box[3] + 1e-6)
-                if aspect_ratio > 10.0 or aspect_ratio < 0.1:
+                if aspect_ratio > 10.0 or aspect_ratio < 0.1: # 太扁或太高
                     target_boxes.append([0.0, 0.0, 0.0, 0.0])
                     loss_mask.append(0.0)
                     continue
-                # ===========================
+                # =================
                 
                 # [几何增强]
                 if do_flip:
@@ -242,46 +210,82 @@ class PoegraphLayoutDataset(Dataset):
                 target_boxes.append(box_aug)
                 loss_mask.append(1.0)
             else:
-                # KG 说有，但 GT 没标 (或已用完) -> 无法计算 Regression Loss，但可以参与 Attention 交互
+                # 这是一个由数量扩展产生的新物体，但在 GT 里没有对应的框
+                # (例如 "两只鸟"，GT只标了1个框)
+                # 这种情况下，我们不计算 Regression Loss，但它仍然参与 Attention 和 Spatial Reasoning
                 target_boxes.append([0.0, 0.0, 0.0, 0.0])
                 loss_mask.append(0.0)
 
-        # 限制最大长度
-        if len(kg_class_ids) > self.max_layout_length:
-            kg_class_ids = kg_class_ids[:self.max_layout_length]
-            kg_class_weights = kg_class_weights[:self.max_layout_length] 
-            target_boxes = target_boxes[:self.max_layout_length]
-            loss_mask = loss_mask[:self.max_layout_length]
-            location_grids_list = location_grids_list[:self.max_layout_length]
+        # 处理空数据情况
+        if not expanded_ids:
+            expanded_ids = [0]
+            kg_class_weights = [0.0]
+            target_boxes = [[0.0]*4]
+            loss_mask = [0.0]
+            spatial_matrix = torch.zeros((1, 1), dtype=torch.long) # Pad 1x1
 
-        # 转为 Tensor
-        location_grids = torch.stack(location_grids_list) # [T, 8, 8]
+        # ---------------------------------------------------------
+        # 5. 生成位置引导信号 (Location Grids - Stateful)
+        # ---------------------------------------------------------
+        location_grids_list = [] 
+        current_occupancy = torch.zeros((8, 8), dtype=torch.float32)
         
-        # [注意] location_grids 也要 Flip!
+        for i, cls_id in enumerate(expanded_ids):
+            cls_id = int(cls_id)
+            if cls_id == 0: # PAD
+                location_grids_list.append(torch.zeros((8, 8), dtype=torch.float32))
+                continue
+                
+            # 获取该物体在 spatial_matrix 中的行和列 (T x T 矩阵)
+            # 注意: 如果是空数据情况，matrix 大小可能不匹配，需保护
+            if i < spatial_matrix.shape[0]:
+                spatial_row = spatial_matrix[i, :]  
+                spatial_col = spatial_matrix[:, i] 
+            else:
+                spatial_row = torch.zeros(len(expanded_ids))
+                spatial_col = torch.zeros(len(expanded_ids))
+            
+            # 推理
+            signal, current_occupancy = self.location_gen.infer_stateful_signal(
+                i, spatial_row, spatial_col, current_occupancy,
+                mode='sample', top_k=3 
+            )
+            
+            # Jitter
+            if random.random() < 0.7: 
+                shift = random.randint(-2, 2) 
+                signal = torch.roll(signal, shifts=shift, dims=1) 
+            
+            location_grids_list.append(signal)
+            
+        location_grids = torch.stack(location_grids_list) # [T, 8, 8]
         if do_flip:
             location_grids = torch.flip(location_grids, dims=[2])
 
         return {
             'input_ids': tokenized['input_ids'].squeeze(0), 
             'attention_mask': tokenized['attention_mask'].squeeze(0), 
-            'kg_class_ids': torch.tensor(kg_class_ids, dtype=torch.long),
+            'kg_class_ids': torch.tensor(expanded_ids, dtype=torch.long),
             'kg_class_weights': torch.tensor(kg_class_weights, dtype=torch.float32), 
             'target_boxes': torch.tensor(target_boxes, dtype=torch.float32),
             'loss_mask': torch.tensor(loss_mask, dtype=torch.float32),
-            'kg_spatial_matrix': kg_spatial_matrix,
+            'kg_spatial_matrix': spatial_matrix, # [T, T] Tensor
             'kg_vector': kg_vector,
-            'num_boxes': torch.tensor(len(gt_boxes), dtype=torch.long),
+            'num_boxes': torch.tensor(len(gt_boxes), dtype=torch.long), # 原始 GT 数量
             'location_grids': location_grids 
         }
 
 def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """Collate function to handle variable length kg_class_ids."""
+    """
+    Collate function to handle variable length fields.
+    Specially handles padding of 2D spatial matrices.
+    """
     input_ids = torch.stack([item['input_ids'] for item in batch])
     attention_mask = torch.stack([item['attention_mask'] for item in batch])
-    kg_spatial_matrices = torch.stack([item['kg_spatial_matrix'] for item in batch])
     kg_vectors = torch.stack([item['kg_vector'] for item in batch])
     num_boxes = torch.stack([item['num_boxes'] for item in batch])
 
+    # 获取 Batch 中的最大序列长度
     lengths = [len(item['kg_class_ids']) for item in batch]
     max_len = max(lengths)
     if max_len == 0: max_len = 1
@@ -292,8 +296,11 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     batched_loss_mask = []
     batched_padding_mask = [] 
     batched_location_grids = []
+    
+    # [NEW] 批量化空间矩阵
+    batched_spatial_matrices = torch.zeros((len(batch), max_len, max_len), dtype=torch.long)
 
-    for item in batch:
+    for i, item in enumerate(batch):
         cur_len = len(item['kg_class_ids'])
         pad_len = max_len - cur_len
         
@@ -325,7 +332,7 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         ])
         batched_loss_mask.append(padded_loss_mask)
 
-        # 5. [NEW] Location Grids
+        # 5. Location Grids
         padded_grids = torch.cat([
             item['location_grids'],
             torch.zeros((pad_len, 8, 8), dtype=torch.float32)
@@ -337,6 +344,11 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         if pad_len > 0:
             pad_mask[cur_len:] = True
         batched_padding_mask.append(pad_mask)
+        
+        # 7. [NEW] Spatial Matrix Padding (2D)
+        mat = item['kg_spatial_matrix']
+        # 将 [T, T] 的矩阵填入 [B, Max, Max] 的左上角
+        batched_spatial_matrices[i, :cur_len, :cur_len] = mat
 
     return {
         'input_ids': input_ids, 
@@ -346,7 +358,7 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'target_boxes': torch.stack(batched_target_boxes),   
         'loss_mask': torch.stack(batched_loss_mask),         
         'padding_mask': torch.stack(batched_padding_mask),   
-        'kg_spatial_matrix': kg_spatial_matrices,
+        'kg_spatial_matrix': batched_spatial_matrices, # [B, Max, Max]
         'kg_vector': kg_vectors,
         'num_boxes': num_boxes,
         'location_grids': torch.stack(batched_location_grids) 
